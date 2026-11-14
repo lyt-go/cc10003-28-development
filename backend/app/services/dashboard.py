@@ -1,8 +1,13 @@
-"""看板配置业务规则：状态流转、字段校验与筛选口径都收在这里。"""
+"""看板配置业务规则：状态流转、字段校验与筛选口径都收在这里。
+
+发布看板时联动 drill_linkage：只能引用同路径的已启用下钻版本，守卫不通过则
+阻止发布并保留旧版本/旧状态；同看板重复发布最终只保留一份当前引用。
+"""
 from __future__ import annotations
 
 from typing import Any
 
+from app.services.drill_linkage import linkage
 from app.store import store
 
 MODULE = "dashboard"
@@ -38,15 +43,21 @@ class DashboardService:
         if missing:
             return None, missing
         rows = store.rows(MODULE)
-        entry = {"id": max((int(row.get("id", 0)) for row in rows), default=0) + 1}
+        entry = {"id": store.next_id(MODULE)}
         entry.update({field: values.get(field) for field in REQUIRED_FIELDS})
         entry["status"] = STATUS_ORDER[0]
         entry["pending"] = True
         entry["abnormal"] = False
+        entry["引用状态"] = "未引用"
         rows.append(entry)
         return entry, []
 
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+    def run_action(
+        self,
+        entry_id: int,
+        action: str,
+        values: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(MODULE, entry_id)
         if entry is None:
             return None, f"看板页面 {entry_id} 不存在或已归档"
@@ -55,6 +66,29 @@ class DashboardService:
         target = ACTION_RULES[action]
         if target not in STATUS_ORDER:
             return None, f"目标状态「{target}」不在允许的状态序列里"
+
+        if action == "发布看板":
+            # 先做守卫，任何不合规都直接返回：状态与旧版本引用保持不变。
+            published, errors = linkage.publish_dashboard(entry, values or {})
+            if errors:
+                return None, "发布被守卫拦截：" + "；".join(errors)
+            entry["status"] = target
+            entry["pending"] = False
+            entry["abnormal"] = False
+            if entry.get("引用状态") == "生效":
+                return entry, (
+                    f"看板已发布并引用 {entry.get('引用路径编号')} "
+                    f"{entry.get('引用路径版本')}，默认展开层 {entry.get('默认展开层')}"
+                )
+            return entry, "看板已发布（未引用下钻路径）"
+
+        if action == "下线看板":
+            entry["status"] = target
+            entry["pending"] = False
+            entry["abnormal"] = True
+            # 下线不改引用快照：保留原配置，用户进入时仍可追溯失效来源。
+            return entry, "看板页面已下线，下钻引用快照保留用于追溯"
+
         entry["status"] = target
         entry["pending"] = target != STATUS_ORDER[-1]
         entry["abnormal"] = action in NEGATIVE_ACTIONS
